@@ -15,9 +15,12 @@ static PyObject* (*PyMarshal_ReadObjectFromString_ptr)(const char*, Py_ssize_t) 
 static std::once_flag marshal_once_flag;
 
 static void resolve_marshal() {
+    // PyMarshal_ReadObjectFromString is part of the stable CPython ABI but is
+    // not declared in any public header we can easily include here, so we
+    // resolve it at runtime. call_once ensures this is thread-safe and happens
+    // exactly once regardless of how many code objects are decrypted in parallel.
     std::call_once(marshal_once_flag, []() {
 #ifdef _WIN32
-        // Windows: Get handle to current executable/DLL
         HMODULE handle = GetModuleHandleA(NULL);
         if (!handle) {
             _exit(1);
@@ -26,8 +29,8 @@ static void resolve_marshal() {
         PyMarshal_ReadObjectFromString_ptr = (PyObject* (*)(const char*, Py_ssize_t))
             GetProcAddress(handle, "PyMarshal_ReadObjectFromString");
 #else
-        // Linux: Use RTLD_DEFAULT to resolve from the already-linked Python library
-        // This avoids hardcoding any specific Python version path
+        // RTLD_DEFAULT resolves against the already-linked libpython, so no
+        // hardcoded version path is needed and no second copy is loaded.
         void* handle = RTLD_DEFAULT;
 
         PyMarshal_ReadObjectFromString_ptr = (PyObject* (*)(const char*, Py_ssize_t))
@@ -35,19 +38,28 @@ static void resolve_marshal() {
 #endif
 
         if (!PyMarshal_ReadObjectFromString_ptr) {
-            _exit(1);  // Silent exit on fatal error
+            _exit(1);
         }
     });
 }
 
+// Decrypt one encrypted code-object blob and return a live PyCodeObject*.
+//
+// Blob layout (matches the output of Encryptor::encrypt in the obfuscator):
+//   [0..11]  nonce  — 12-byte random value, unique per code object per build
+//   [12..27] tag    — 16-byte Poly1305 authentication tag
+//   [28..]   ciphertext — ChaCha20-encrypted marshal'd PyCodeObject
+//
+// Returns nullptr on any failure (wrong key, corrupt blob, or non-code object).
+// The caller owns the returned reference and must Py_DECREF when done.
 PyCodeObject* decrypt_code_object(const std::vector<uint8_t>& blob, const uint8_t* key) {
     resolve_marshal();
 
+    // 28 = 12 (nonce) + 16 (tag); anything shorter can't be a valid blob.
     if (blob.empty() || blob.size() < 28) {
         return nullptr;
     }
 
-    // Extract components: nonce (12) + tag (16) + ciphertext
     unsigned char nonce[12];
     memcpy(nonce, blob.data(), 12);
     unsigned char tag[16];
@@ -55,9 +67,11 @@ PyCodeObject* decrypt_code_object(const std::vector<uint8_t>& blob, const uint8_
     const unsigned char* ciphertext = blob.data() + 28;
     unsigned long long ciphertext_len = blob.size() - 28;
 
-    // Decrypt
     std::vector<unsigned char> plaintext(ciphertext_len);
 
+    // _detached variant takes the tag separately, matching how the obfuscator
+    // splits and stores it. Returns non-zero if authentication fails (wrong key
+    // or tampered ciphertext) — in that case we bail out silently.
     int ret = crypto_aead_chacha20poly1305_decrypt_detached(
         plaintext.data(), nullptr,
         ciphertext, ciphertext_len,
@@ -71,7 +85,9 @@ PyCodeObject* decrypt_code_object(const std::vector<uint8_t>& blob, const uint8_
         return nullptr;
     }
 
-    // Unmarshal bytecode
+    // The plaintext is a standard marshal'd code object, identical to what
+    // Python would write into a .pyc file. Feed it back through the marshal
+    // reader to get a live PyCodeObject*.
     PyObject* code = PyMarshal_ReadObjectFromString_ptr(
         reinterpret_cast<const char*>(plaintext.data()),
         plaintext.size()

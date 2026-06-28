@@ -86,12 +86,19 @@ extern "C" int snek_check_environment() {
 }
 
 // ---------- Data structures ----------
+
+// One entry per protected code object. The encrypted_blob is written at startup
+// by the generated register_* calls; decrypted_code is populated lazily on first
+// execution and reused for every subsequent call to that function.
 struct CodeObjectCache {
     std::vector<uint8_t> encrypted_blob;
     PyCodeObject* decrypted_code;
     bool is_decrypted;
 };
 
+// Keyed by the *original* (placeholder) PyCodeObject* embedded in the binary.
+// shared_mutex allows many concurrent readers (hot path) with exclusive writer
+// only on the first decryption of each code object.
 static std::unordered_map<PyCodeObject*, CodeObjectCache> code_cache;
 static std::shared_mutex cache_mutex;
 
@@ -113,9 +120,15 @@ static void resolve_frame_symbols() {
     static bool done = false;
     if (done) return;
 
+    // We resolve the frame-eval symbols dynamically rather than linking against
+    // them directly. This keeps the binary compatible with any patch release of
+    // Python 3.12/3.14 without recompilation, and avoids duplicate-symbol
+    // conflicts that would occur if we dlopen'd a second copy of libpython.
 #ifdef _WIN32
-    // Windows: Use GetProcAddress to get symbols from the Python DLL
-    HMODULE handle = GetModuleHandleA(NULL);  // Get handle to current executable
+    // On Windows, all CPython symbols are exported from the main executable
+    // (python.exe embeds them) or from python3xx.dll. GetModuleHandleA(NULL)
+    // returns a handle to whichever module owns the process entry point.
+    HMODULE handle = GetModuleHandleA(NULL);
     if (!handle) { exit(1); }
 
 #define RESOLVE(sym) do { \
@@ -123,8 +136,9 @@ static void resolve_frame_symbols() {
     if (!sym##_ptr) { exit(1); } \
 } while(0)
 #else
-    // Linux: Use dlsym to get symbols from the already-linked Python library
-    // This avoids loading a second Python library which would cause conflicts
+    // On Linux, RTLD_DEFAULT searches the global symbol table, which includes
+    // everything already linked into the process — in our case, libpython3.x.so.
+    // This avoids loading a second Python library which would cause conflicts.
     void* handle = RTLD_DEFAULT;
 
 #define RESOLVE(sym) do { \
@@ -216,16 +230,22 @@ PyObject* protected_eval_frame(PyThreadState* tstate,
     PyCodeObject* exec_code = get_or_decrypt_code(code);
 
     if (exec_code != code) {
-        // 1. Swap the code object
+        // Patch the frame in place so _PyEval_EvalFrameDefault executes the
+        // decrypted code object instead of the placeholder.
+
+        // 1. Overwrite the code object pointer in the frame struct.
         void** frame_code_ptr = (void**)((uint8_t*)frame + f_code_offset);
         *frame_code_ptr = (void*)exec_code;
 
-        // 2. CRITICAL: Reset instruction pointer for Python 3.11/3.12
-        // prev_instr must point to the instruction BEFORE the first one to execute
+        // 2. Reset prev_instr to one slot before co_code_adaptive so the
+        //    adaptive interpreter starts at instruction 0 of the new code
+        //    object. Skipping this causes an immediate SEGFAULT on 3.11+
+        //    because the speculative branch cache is stale from the placeholder.
         void** prev_instr_ptr = (void**)((uint8_t*)frame + f_prev_instr_offset);
         *prev_instr_ptr = (void*)(exec_code->co_code_adaptive - 1);
 
-        // Transfer reference ownership to the frame
+        // Transfer reference ownership: the frame now holds exec_code, so
+        // increment its refcount and release the placeholder.
         Py_INCREF(exec_code);
         Py_DECREF(code);
     }
